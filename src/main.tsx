@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { Chess, type Color, type PieceSymbol, type Square } from 'chess.js';
 import { makeCommandId } from './command-id.js';
+import { completeSeatClaim, prepareSeatClaim, readPendingClaim } from './seat-claim.js';
 import './style.css';
 
 type Move = { from: string; to: string; san: string; color: Color; promotion?: string };
@@ -25,6 +26,7 @@ function App(){
   const socket=useRef<WebSocket|null>(null), pending=useRef<PendingCommand|null>(null),stateRef=useRef<State|null>(null),sentOn=useRef<WebSocket|null>(null),boardRef=useRef<HTMLDivElement|null>(null),dialogRef=useRef<HTMLDialogElement|null>(null);
   useEffect(()=>{const t=setInterval(()=>setNow(Date.now()),100);return()=>clearInterval(t);},[]);
   useEffect(()=>{const changed=()=>{setIdentity(readIdentity());setState(null);setSelected(null);setError('');pending.current=null;setAwaiting(false);};window.addEventListener('hashchange',changed);return()=>window.removeEventListener('hashchange',changed);},[]);
+  useEffect(()=>{if(identity?.invite&&!identity.token){try{if(readPendingClaim(window.sessionStorage,identity.roomId))setMessage('Your previous seat request is saved in this tab. Retry to restore your Black seat.');}catch{/* The join action shows storage errors before any HTTP request. */}}},[identity?.roomId,identity?.token,identity?.invite]);
   useEffect(()=>{stateRef.current=state;},[state]);
   useEffect(()=>{if(confirm||promotion)dialogRef.current?.showModal();else dialogRef.current?.close();},[confirm,promotion]);
   useEffect(()=>{
@@ -57,7 +59,17 @@ function App(){
   function enter(next:Identity){const params=new URLSearchParams({room:next.roomId,...(next.token?{token:next.token}:{}),...(next.invite?{invite:next.invite}:{})});history.replaceState(null,'','#'+params);pending.current=null;sentOn.current=null;setAwaiting(false);setState(null);setIdentity(next);setSelected(null);setFlipped(false);setMessage('');setError('');setInviteVisible(false);}
   async function request(path:string,data:unknown){const res=await fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});const result=await res.json();if(!res.ok)throw new Error(result.message||'The table is unavailable.');return result;}
   async function create(){setBusy(true);setError('');try{const [seconds,increment]=control.split('+').map(Number);enter(await request('/api/rooms',{seconds,increment}));}catch(e){setError((e as Error).message);}finally{setBusy(false);setConfirm(null);}}
-  async function join(){if(!identity)return;setBusy(true);setError('');try{enter(await request(`/api/rooms/${identity.roomId}/join`,{invite:identity.invite}));}catch(e){setError((e as Error).message);}finally{setBusy(false);}}
+  async function join(){
+    if(!identity)return;setBusy(true);setError('');
+    try {
+      let storage:Storage;
+      try {storage=window.sessionStorage;}catch{throw new Error('Enable browser storage before joining so your seat can be recovered after an interrupted request.');}
+      const claimToken=prepareSeatClaim(storage,identity.roomId);
+      setMessage('Your seat request is saved in this tab. If the connection interrupts, retry here.');
+      const result=await request(`/api/rooms/${identity.roomId}/join`,{invite:identity.invite,claimToken});
+      enter(result);completeSeatClaim(storage,identity.roomId);
+    }catch(e){setError((e as Error).message);}finally{setBusy(false);}
+  }
   function send(command:Omit<PendingCommand,'commandId'|'expectedVersion'>){
     if(!state||connection!=='online'||awaiting)return;
     if(socket.current?.readyState!==WebSocket.OPEN){setError('The connection changed. Wait for your table to reconnect.');return;}

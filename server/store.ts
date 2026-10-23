@@ -59,15 +59,19 @@ export class GameStore {
     this.db.prepare('INSERT INTO rooms(id,white_hash,invite_hash,state) VALUES(?,?,?,?)').run(id,digest(token),digest(invite),JSON.stringify(game));
     return { roomId: id, token, invite };
   }
-  join(id: string, invite: unknown) {
+  join(id: string, invite: unknown, claimToken: unknown) {
     if (typeof invite !== 'string' || invite.length !== 43) throw new Problem('invalid_invite', 'That invitation is invalid.', 403);
+    if (typeof claimToken !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(claimToken) || Buffer.from(claimToken,'base64url').length !== 32 || Buffer.from(claimToken,'base64url').toString('base64url') !== claimToken)
+      throw new Problem('invalid_claim','Create and save a 32-byte seat capability before claiming the invitation.');
     return this.transaction(() => {
       const row = this.row(id);
       if (!sameHash(row.invite_hash, digest(invite))) throw new Problem('invalid_invite', 'That invitation is invalid.', 403);
-      if (row.black_hash) throw new Problem('invite_claimed', 'The Black seat has already been claimed. Use your saved seat link to return.', 409);
-      const token = secret();
-      this.db.prepare('UPDATE rooms SET black_hash=? WHERE id=?').run(digest(token),id);
-      return { roomId: id, token };
+      const claimHash=digest(claimToken);
+      if(sameHash(claimHash,row.white_hash)||sameHash(claimHash,row.invite_hash)) throw new Problem('invalid_claim','The seat capability must be independent of the invitation and other seat.');
+      if (row.black_hash && !sameHash(row.black_hash,claimHash)) throw new Problem('invite_claimed', 'The Black seat has already been claimed. Use your saved seat link to return.', 409);
+      if (!row.black_hash) this.db.prepare('UPDATE rooms SET black_hash=? WHERE id=?').run(claimHash,id);
+      // Retry returns only the capability supplied by this caller, never another holder's token.
+      return { roomId: id, token: claimToken };
     });
   }
   authenticate(id: string, token: unknown): Color {

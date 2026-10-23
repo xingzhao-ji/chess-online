@@ -4,6 +4,7 @@ import { resolve, extname, sep } from 'node:path';
 import { WebSocketServer, WebSocket } from 'ws';
 import type { Color } from 'chess.js';
 import { GameStore, Problem, parseCommand } from './store.js';
+import { canQueueOutbound, sendBounded } from './outbound.js';
 
 type Session = { roomId: string; seat: Color };
 type Options = { dbPath: string; clientDir?: string; allowedOrigin?: string; now?: ()=>number };
@@ -12,9 +13,9 @@ const MIME: Record<string,string> = {'.html':'text/html; charset=utf-8','.js':'t
 export function createApp(options: Options) {
   const store = new GameStore(options.dbPath, options.now);
   const sessions = new Map<WebSocket,Session>();
-  const wss = new WebSocketServer({noServer:true,maxPayload:8192});
+  const wss = new WebSocketServer({noServer:true,maxPayload:8192,autoPong:false});
   const budgets = new Map<string,{since:number,count:number}>();
-  const send = (socket:WebSocket, value:unknown) => { if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(value)); };
+  const send = sendBounded;
   const presence = (id:string) => ({w:[...sessions.values()].some(s=>s.roomId===id&&s.seat==='w'),b:[...sessions.values()].some(s=>s.roomId===id&&s.seat==='b')});
   const state = (socket:WebSocket,s:Session) => send(socket,{...store.snapshot(s.roomId,s.seat),online:presence(s.roomId)});
   const broadcast = (id:string) => { for (const [socket,s] of sessions) if(s.roomId===id) state(socket,s); };
@@ -51,7 +52,7 @@ export function createApp(options: Options) {
           return json(res,201,store.create(data.seconds,data.increment));
         }
         const join=url.pathname.match(/^\/api\/rooms\/([\w-]+)\/join$/);
-        if(join&&req.method==='POST') { const data=await body(req); const seat=store.join(join[1],data.invite); broadcast(join[1]); return json(res,200,seat); }
+        if(join&&req.method==='POST') { const data=await body(req); const seat=store.join(join[1],data.invite,data.claimToken); broadcast(join[1]); return json(res,200,seat); }
         throw new Problem('not_found','Endpoint not found.',404);
       }
       if(req.method!=='GET'&&req.method!=='HEAD') throw new Problem('method_not_allowed','Use GET.',405);
@@ -73,7 +74,8 @@ export function createApp(options: Options) {
     let count=0, window=Date.now(), alive=true;
     const authTimer=setTimeout(()=>{if(!sessions.has(socket)) socket.close(1008,'Authentication required');},5000);
     socket.on('pong',()=>{alive=true;});
-    const heartbeat=setInterval(()=>{if(!alive) return socket.terminate(); alive=false; socket.ping();},30000);
+    socket.on('ping',data=>{if(canQueueOutbound(socket,data.length+2))socket.pong(data);});
+    const heartbeat=setInterval(()=>{if(!alive) return socket.terminate(); alive=false; if(canQueueOutbound(socket,2))socket.ping();},30000);
     socket.on('error',()=>{});
     socket.on('message',raw=>{
       try {

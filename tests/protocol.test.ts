@@ -1,6 +1,7 @@
 import test, { type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, randomBytes } from 'node:crypto';
+import { createServer as createProxyServer } from 'node:http';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -24,7 +25,7 @@ class Peer {
   close(){for(const waiter of this.waiters){clearTimeout(waiter.timer);waiter.reject(new Error('Peer closed'));}this.waiters=[];this.ws.terminate();}
 }
 async function post(port:number,path:string,body:unknown,headers:Record<string,string>={}){const res=await fetch(`http://127.0.0.1:${port}${path}`,{method:'POST',headers:{'Content-Type':'application/json',...headers},body:JSON.stringify(body)});return {status:res.status,body:await res.json() as Message};}
-async function seats(port:number,seconds=60,increment=0){const created=await post(port,'/api/rooms',{seconds,increment});assert.equal(created.status,201);const black=await post(port,`/api/rooms/${created.body.roomId}/join`,{invite:created.body.invite});assert.equal(black.status,200);return {white:created.body,black:black.body};}
+async function seats(port:number,seconds=60,increment=0){const created=await post(port,'/api/rooms',{seconds,increment});assert.equal(created.status,201);const black=await post(port,`/api/rooms/${created.body.roomId}/join`,{invite:created.body.invite,claimToken:randomBytes(32).toString('base64url')});assert.equal(black.status,200);return {white:created.body,black:black.body};}
 async function fixture(t:TestContext,seconds=60){const dir=await mkdtemp(join(tmpdir(),'chess-protocol-'));const app=createApp({dbPath:join(dir,'room.sqlite')});const port=await app.listen(0);const s=await seats(port,seconds);const white=await Peer.open(port,s.white.roomId,s.white.token),black=await Peer.open(port,s.black.roomId,s.black.token);await white.wait(m=>m.type==='state');await black.wait(m=>m.type==='state');t.after(async()=>{white.close();black.close();await app.close();await rm(dir,{recursive:true,force:true});});return {app,port,white,black,seats:s};}
 const move=(expectedVersion:number,from:string,to:string,extra:Message={})=>({type:'move',expectedVersion,from,to,...extra});
 
@@ -55,7 +56,7 @@ test('capabilities protect seats; invite is single-use; cross-origin and malform
   const f=await fixture(t);
   const bad=await Peer.open(f.port,f.seats.white.roomId,'x'.repeat(43));t.after(()=>bad.close());
   assert.equal((await bad.wait(m=>m.type==='error')).code,'unauthorized');
-  const claimed=await post(f.port,`/api/rooms/${f.seats.white.roomId}/join`,{invite:f.seats.white.invite});assert.equal(claimed.status,409);
+  const claimed=await post(f.port,`/api/rooms/${f.seats.white.roomId}/join`,{invite:f.seats.white.invite,claimToken:randomBytes(32).toString('base64url')});assert.equal(claimed.status,409);
   const rejected=await post(f.port,'/api/rooms',{seconds:60,increment:0},{Origin:'https://unrelated.example'});assert.equal(rejected.status,403);
   const invalidClock=await post(f.port,'/api/rooms',{seconds:true,increment:0});assert.equal(invalidClock.status,400);
   const tooLarge=await post(f.port,'/api/rooms',{seconds:60,increment:0,padding:'x'.repeat(5000)});assert.equal(tooLarge.status,413);
@@ -96,10 +97,43 @@ test('server-owned clocks do not start while waiting and timeout once after the 
 });
 
 test('SQLite transaction rolls back game, move and receipt together after an injected write failure',async()=>{
-  const store=new GameStore(':memory:');try{const seat=store.create(60,0);store.join(seat.roomId,seat.invite);store.db.exec("CREATE TRIGGER fail_move BEFORE INSERT ON moves BEGIN SELECT RAISE(ABORT, 'injected failure'); END");
+  const store=new GameStore(':memory:');try{const seat=store.create(60,0);store.join(seat.roomId,seat.invite,randomBytes(32).toString('base64url'));store.db.exec("CREATE TRIGGER fail_move BEFORE INSERT ON moves BEGIN SELECT RAISE(ABORT, 'injected failure'); END");
     const command=parseCommand(move(0,'e2','e4',{commandId:'transaction-test'}));assert.throws(()=>store.command(seat.roomId,'w',command),/injected failure/);assert.equal(store.snapshot(seat.roomId,'w').version,0);assert.equal((store.db.prepare('SELECT COUNT(*) AS n FROM commands').get() as {n:number}).n,0);
     store.db.exec('DROP TRIGGER fail_move');assert.equal(store.command(seat.roomId,'w',command).ok,true);
   }finally{store.close();}
+});
+
+test('a committed join whose HTTP response is dropped can be retried only by its original claimant',async t=>{
+  const f=await fixture(t);
+  const created=await post(f.port,'/api/rooms',{seconds:60,increment:0});
+  const {roomId,invite}=created.body;
+  const claimToken=randomBytes(32).toString('base64url');
+  const data={invite,claimToken};
+  let committedStatus=0;
+  const proxy=createProxyServer(async(req,res)=>{
+    let body='';for await(const chunk of req)body+=chunk.toString();
+    const forwarded=await fetch(`http://127.0.0.1:${f.port}/api/rooms/${roomId}/join`,{method:'POST',headers:{'Content-Type':'application/json'},body});
+    committedStatus=forwarded.status;
+    await forwarded.arrayBuffer(); // Consume the committed response, then lose it before the client sees anything.
+    res.destroy();
+  });
+  await new Promise<void>(resolve=>proxy.listen(0,'127.0.0.1',resolve));
+  t.after(()=>new Promise<void>(resolve=>proxy.close(()=>resolve())));
+  await assert.rejects(post((proxy.address() as {port:number}).port,'/join',data));
+  assert.equal(committedStatus,200);
+  const recovered=await post(f.port,`/api/rooms/${roomId}/join`,data);
+  assert.equal(recovered.status,200);assert.equal(recovered.body.token,claimToken);
+  const black=await Peer.open(f.port,roomId,recovered.body.token);t.after(()=>black.close());assert.equal((await black.wait(m=>m.type==='state')).seat,'b');
+  const other=await post(f.port,`/api/rooms/${roomId}/join`,{invite,claimToken:randomBytes(32).toString('base64url')});
+  assert.equal(other.status,409);assert.ok(!JSON.stringify(other.body).includes(claimToken));
+});
+
+test('join requires canonical 32-byte claims and rejects aliases to the other seat or invitation',async t=>{
+  const f=await fixture(t);const created=await post(f.port,'/api/rooms',{seconds:60,increment:0});const {roomId,invite,token}=created.body;
+  for(const claimToken of [undefined,'x'.repeat(43),'a'.repeat(42)+'!',randomBytes(31).toString('base64url'),invite,token]){
+    const result=await post(f.port,`/api/rooms/${roomId}/join`,{invite,claimToken});assert.equal(result.status,400);assert.equal(result.body.code,'invalid_claim');
+  }
+  const accepted=await post(f.port,`/api/rooms/${roomId}/join`,{invite,claimToken:randomBytes(32).toString('base64url')});assert.equal(accepted.status,200);
 });
 
 async function startChild(dbPath:string):Promise<{child:ChildProcess,port:number}>{

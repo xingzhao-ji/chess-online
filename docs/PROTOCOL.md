@@ -4,7 +4,7 @@
 
 `POST /api/rooms` accepts JSON `{ "seconds": 600, "increment": 5 }`. Integer ranges are 1–3600 and 0–30. A 201 response contains `{ roomId, token, invite }`; `token` controls White. These are capabilities: do not put responses into logs.
 
-`POST /api/rooms/:id/join` accepts `{ "invite": "..." }`. It atomically claims Black and returns `{ roomId, token }`. A subsequent claim returns HTTP 409. Both authenticated seats can use multiple connections; their commands still serialize against one game version.
+`POST /api/rooms/:id/join` accepts `{ "invite": "...", "claimToken": "..." }`. Before sending, the client generates a cryptographically random 32-byte capability, encodes it as canonical unpadded base64url (43 characters), and persists it in this tab's session storage. The server atomically binds its hash to Black and returns `{ roomId, token }`, where `token` is exactly the caller's `claimToken`. Retrying with the same valid invite and capability is safe, including after a lost response or server restart. A different capability returns HTTP 409 and never reveals the original token. Noncanonical capabilities or aliases to White's capability/the invitation are rejected. Both authenticated seats can use multiple connections; their commands still serialize against one game version.
 
 `GET /api/health` returns `{ "ok": true }`. Errors return `{ code, message }`. Browser requests must have same-host Origin or the configured exact `WEB_ORIGIN`. There is no CORS allow-all header.
 
@@ -17,6 +17,8 @@ Connect to `/socket` with no capability in the URL. Within five seconds send:
 ```
 
 The server authenticates once per connection. A `state` message includes `roomId`, `seat`, `version`, `fen`, `moves`, `whiteMs`, `blackMs`, `running`, `turn`, `outcome`, `check`, `blackJoined`, `serverNow`, `legalMoves` and `online`. Clocks are evaluated at `serverNow`. The browser measures local elapsed time since receiving the snapshot for a display estimate. No client-supplied time is trusted. `legalMoves` is populated only for the current authenticated player. Send `{ "type": "sync" }` for another state snapshot; the shipped client does this every five seconds.
+
+All application writes—including replies and unsolicited position/presence broadcasts—use the same bounded-send helper. It checks `bufferedAmount + UTF-8 bytes of next message` before sending and terminates the connection if the result would exceed 256 KiB. Ping and pong control frames use the same budget check; automatic pong is disabled in favor of this bounded handler. The bound concerns the application/WebSocket queue; operating-system TCP buffers are separate. A client that stops reading cannot keep growing the application queue merely by sending pong frames.
 
 ```json
 {
@@ -44,4 +46,6 @@ The current deployment model is a single Node process. Do not run multiple serve
 
 ## Client reconnection
 
-Connections retry with bounded backoff up to five seconds. After authenticating and receiving a state, the client resends its in-memory unacknowledged command once on that connection. This is safe through command receipts. The pending queue is not written to browser storage; a full page reload obtains current state instead. Private seat links in the URL fragment survive reload. A fragment is not sent in normal HTTP requests or Referer headers, but remains readable by browser extensions, local history and anyone shown the URL.
+Connections retry with bounded backoff up to five seconds. After authenticating and receiving a state, the client resends its in-memory unacknowledged command once on that connection. This is safe through command receipts. The pending move queue is not written to browser storage; a full page reload obtains current state instead. Private seat links in the URL fragment survive reload. A fragment is not sent in normal HTTP requests or Referer headers, but remains readable by browser extensions, local history and anyone shown the URL.
+
+Pending **seat claims** have a different lifecycle: the capability is written and read back from session storage before the HTTP request. Failed requests retain it. Reloading the same tab reads the saved capability and offers a retry. Only after the returned private seat URL is installed does the client remove the pending claim. If storage cannot be accessed or retain the value, the UI shows an error and sends no claim request. Tab closure/storage clearing can lose this recovery identity; this is not account-based recovery.

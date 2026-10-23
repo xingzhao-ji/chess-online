@@ -14,7 +14,7 @@ npm run build
 npm start
 ```
 
-Open **http://127.0.0.1:3002**. Create a table and copy its invitation into a second browser or private window. The invitation claims Black once. Keep each browser's **private seat link** to resume after a reload or reconnect. Anyone with that link can control that seat, so share only the invitation with your opponent.
+Open **http://127.0.0.1:3002**. Create a table and copy its invitation into a second browser or private window. The invitation claims Black once. Before joining, the client securely generates and saves its pending seat capability in this tab's session storage. If the response is lost, retry in the same tab—even after reload—to recover the same seat. A different claimant remains denied. Keep each browser's **private seat link** to resume after a reload or reconnect. Anyone with that link can control that seat, so share only the invitation with your opponent.
 
 The database defaults to `data/chess.sqlite`. Restarting with the same file preserves games and command receipts. To expose a local server to your LAN, set `HOST=0.0.0.0` and share its reachable address. Put public deployments behind HTTPS; do not send capability links across untrusted plain HTTP.
 
@@ -29,7 +29,7 @@ For development, run `npm run dev:server` in one terminal and `npm run dev` in a
 
 ## What is implemented
 
-- One-use room invitations and independent random 256-bit seat capabilities. Only hashes are stored in SQLite. URL fragments keep capabilities out of HTTP request paths; sockets authenticate with a message, not a URL query.
+- One-use room invitations and independent random 256-bit seat capabilities. Black's pending capability is saved before claim submission and repeated claims from that same capability safely recover after lost responses. Only hashes are stored in SQLite. URL fragments keep capabilities out of HTTP request paths; sockets authenticate with a message, not a URL query.
 - Server-side chess.js move validation, selected promotion/underpromotion, castling, en passant, checkmate and automatic draw adjudication. No optimistic moves change the displayed board before acknowledgment.
 - Monotonic game version and idempotent command IDs bound to authenticated seat **and canonical payload**, including the expected version. Replays return the original receipt; changed-payload or cross-seat reuse is refused.
 - A single SQLite transaction publishes state, accepted move and command receipt. WAL with `synchronous=FULL` is enabled. Failed receipts are also persisted; retrying the same rejected action preserves that result.
@@ -51,7 +51,7 @@ npm test
 npm run build
 ```
 
-The integration suite starts real HTTP/WebSocket servers on ephemeral loopback ports with isolated on-disk SQLite databases. It covers two-player agreement, illegal/out-of-turn/stale actions, duplicate ID payload and actor conflicts, concurrent connections to one seat, invalid capabilities, single-use invites, reconnect/retry, promotion, mate, resignation, threefold repetition and timeout. A database trigger injects failure between state publication and move insertion to prove transaction rollback. A separate Node process is killed with **SIGKILL**, then recreated against the same SQLite file to verify committed moves/receipts and downtime timeout semantics.
+The integration suite starts real HTTP/WebSocket servers on ephemeral loopback ports with isolated on-disk SQLite databases. It covers two-player agreement, illegal/out-of-turn/stale actions, duplicate ID payload and actor conflicts, concurrent connections to one seat, invalid capabilities, single-use invites, reconnect/retry, promotion, mate, resignation, threefold repetition and timeout. A real HTTP proxy consumes a committed join response and then drops it to verify safe claim recovery. A database trigger injects failure between state publication and move insertion to prove transaction rollback. A separate Node process is killed with **SIGKILL**, then recreated against the same SQLite file to verify committed moves/receipts and downtime timeout semantics. Focused helper tests verify session-storage failure handling and the outbound WebSocket byte budget.
 
 See [recorded validation](docs/VALIDATION.md). These tests are not browser, accessibility, throughput or production availability certification. No 100-room stress result is claimed.
 
@@ -67,7 +67,7 @@ Open http://localhost:3002. The named `chess-data` volume retains SQLite files a
 
 [Protocol](docs/PROTOCOL.md) describes wire messages and recovery. [Plan](docs/PLAN.md) records the bounded scope.
 
-One Node process owns one SQLite database. This is not a horizontally scaled architecture. Native clients may omit Origin but still require capabilities; browser Origin is checked. Limits include 4 KiB HTTP JSON bodies, 8 KiB WebSocket frames, 500 simultaneous sockets, in-memory per-address API limits and per-connection command limits. These are basic resource controls, not comprehensive public-service abuse protection. No accounts, ratings, matchmaking, chat, anti-cheat, admin console, automatic retention or capability rotation/recovery is implemented. Lost seat links cannot be recovered. Room and receipt records accumulate until the operator archives/removes the database. Use trusted local storage and backups; no physical power-loss guarantee is claimed.
+One Node process owns one SQLite database. This is not a horizontally scaled architecture. Native clients may omit Origin but still require capabilities; browser Origin is checked. Limits include 4 KiB HTTP JSON bodies, 8 KiB incoming WebSocket frames, a 256 KiB application outbound queue/frame budget per socket, 500 simultaneous sockets, in-memory per-address API limits and per-connection command limits. A socket is terminated before the next message would exceed its outbound budget, including unsolicited broadcasts. These are basic resource controls, not comprehensive public-service abuse protection. No accounts, ratings, matchmaking, chat, anti-cheat, admin console, automatic retention or capability rotation/recovery is implemented. Lost seat links cannot be recovered after a successful claim; pending join recovery requires the original tab's session storage. Closing that tab or clearing its storage can lose a pending seat. If session storage is unavailable, joining is refused before a claim request is sent. Room and receipt records accumulate until the operator archives/removes the database. Use trusted local storage and backups; no physical power-loss guarantee is claimed.
 
 Games are private capabilities, not end-to-end encrypted content. The server and database operator can read move histories. This app does not log HTTP requests, authentication payloads, room links or tokens; the CLI prints only its listening port. HTTPS termination and operational logs are the deployer's responsibility.
 
