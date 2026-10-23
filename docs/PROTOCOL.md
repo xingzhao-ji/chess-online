@@ -1,0 +1,47 @@
+# Protocol and persistence
+
+## HTTP
+
+`POST /api/rooms` accepts JSON `{ "seconds": 600, "increment": 5 }`. Integer ranges are 1–3600 and 0–30. A 201 response contains `{ roomId, token, invite }`; `token` controls White. These are capabilities: do not put responses into logs.
+
+`POST /api/rooms/:id/join` accepts `{ "invite": "..." }`. It atomically claims Black and returns `{ roomId, token }`. A subsequent claim returns HTTP 409. Both authenticated seats can use multiple connections; their commands still serialize against one game version.
+
+`GET /api/health` returns `{ "ok": true }`. Errors return `{ code, message }`. Browser requests must have same-host Origin or the configured exact `WEB_ORIGIN`. There is no CORS allow-all header.
+
+## WebSocket
+
+Connect to `/socket` with no capability in the URL. Within five seconds send:
+
+```json
+{ "type": "hello", "roomId": "<room-id>", "token": "<private-seat-capability>" }
+```
+
+The server authenticates once per connection. A `state` message includes `roomId`, `seat`, `version`, `fen`, `moves`, `whiteMs`, `blackMs`, `running`, `turn`, `outcome`, `check`, `blackJoined`, `serverNow`, `legalMoves` and `online`. Clocks are evaluated at `serverNow`. The browser measures local elapsed time since receiving the snapshot for a display estimate. No client-supplied time is trusted. `legalMoves` is populated only for the current authenticated player. Send `{ "type": "sync" }` for another state snapshot; the shipped client does this every five seconds.
+
+```json
+{
+  "type": "move",
+  "commandId": "<new-UUID>",
+  "expectedVersion": 0,
+  "from": "e2",
+  "to": "e4"
+}
+```
+
+Promotion requires `"promotion": "q"`, `"r"`, `"b"` or `"n"`. A resignation uses `{ "type": "resign", "commandId": "...", "expectedVersion": 4 }`.
+
+An `ack` has `commandId`, `ok`, `version` and, on rejection, `code`/`message`. Every well-formed new command records a receipt inside the state transaction, including rejected commands. Malformed envelopes are `error` messages and receive no receipt. Retry an uncertain command with **exactly** the same ID and fields. A receipt does not imply the current state is at its historical version; always consume the following authoritative state. A stale-version rejection requires a new action/new ID against the latest snapshot.
+
+IDs are unique within a room. Their canonical payload contains all semantic fields; extra unsupported JSON keys are ignored and never gain authority. Reusing an ID with another seat or different canonical fields returns `command_conflict`. Clock expiry is checked before command receipt replay, so retrying a historical command cannot pause time or undo an outcome.
+
+## SQLite transaction
+
+`rooms` stores hashed seat/invite capabilities, serialized game state and an indexed deadline. `moves` stores accepted SAN, resulting FEN, ply and command identity. `commands` stores authenticated seat, canonical payload, receipt and timestamp. There are no raw capabilities in these tables.
+
+Each command runs in `BEGIN IMMEDIATE` → check deadline → read/check receipt → check version and rules → update state → insert accepted move (if any) → insert receipt → `COMMIT`. Any write failure rolls back the whole operation. Deadline adjudication is also a transaction and increments version once. No network reply is emitted before commit. A 200 ms timer checks only indexed due deadlines, and authenticated state reads also check expiry. Reload rebuilds chess.js from persisted SAN moves so repetition history remains available.
+
+The current deployment model is a single Node process. Do not run multiple server processes on the same file: SQLite will serialize writes, but cross-process WebSocket broadcasts and presence are not implemented. Persistent volumes must be local filesystem volumes with proper SQLite locking semantics.
+
+## Client reconnection
+
+Connections retry with bounded backoff up to five seconds. After authenticating and receiving a state, the client resends its in-memory unacknowledged command once on that connection. This is safe through command receipts. The pending queue is not written to browser storage; a full page reload obtains current state instead. Private seat links in the URL fragment survive reload. A fragment is not sent in normal HTTP requests or Referer headers, but remains readable by browser extensions, local history and anyone shown the URL.

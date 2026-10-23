@@ -1,0 +1,10 @@
+services:
+  chess:
+    build: .
+    ports:
+      - "3002:3002"
+    volumes:
+      - chess-data:/app/data
+    restart: unless-stopped
+volumes:
+  chess-data:

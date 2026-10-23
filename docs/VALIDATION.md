@@ -1,0 +1,11 @@
+# Recorded validation
+
+Environment: Node.js 24.19.0 on the implementation Linux host, 2026-10-23. These are local results, not a deployment or load claim.
+
+- `npm test`: 13/13 tests pass. Real WebSocket/HTTP transport, isolated SQLite files, protocol invariants, a transaction-write failure injection, actual SIGKILL/process recreation, and secure command-ID fallback behavior are exercised.
+- `npm run build`: passes strict TypeScript checks for client/server/tests, Vite client production build, and Node server compilation.
+- Browser visual/interaction/accessibility QA: parent integration review confirmed create/invite/join, then found `crypto.randomUUID` unavailable on an HTTP preview origin. The command-ID helper now falls back to `crypto.getRandomValues`, with focused tests; parent browser revalidation remains separate.
+- Docker build/run: not performed by this implementer. Dockerfile and Compose configuration are provided.
+- 100-room or sustained load tests: not run. No throughput/latency/concurrency benchmark is claimed.
+
+The first test invocation used the tsx CLI, whose temporary Unix socket was unavailable in this environment. The script now uses Node's supported `--import tsx` loader; the passing runs use that command. An initial CSS build failed on an unnecessary data import; it was removed before the passing build. These were tooling failures, not evidence of passing runtime checks.
